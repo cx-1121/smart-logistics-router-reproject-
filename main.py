@@ -11,24 +11,10 @@ if sys.stdout.encoding != "utf-8":
 
 from model.node import Node
 from model.driver import Driver
+from model.task import DeliveryTask
 from model.enviroment import Environment
 from model.aco import ACO
 from services.spatial_index import SpatialIndexer
-
-
-class DeliveryTask:
-    """
-    业务订单任务：包含取货点、送货点与货物重量。
-    天然绑定 PDP 先序依赖约束（送货前必须先取货）。
-    """
-    def __init__(self, task_name: str, pickup: Node, delivery: Node, weight: float = 3.0):
-        self.task_name = task_name
-        self.pickup = pickup
-        self.delivery = delivery
-        self.weight = weight
-        # 确保送货点的前置依赖严格包含取货点
-        if self.pickup.id not in self.delivery.prerequisites:
-            self.delivery.prerequisites.append(self.pickup.id)
 
 
 def build_simulation_scenario():

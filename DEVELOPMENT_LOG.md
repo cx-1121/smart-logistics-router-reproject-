@@ -9,6 +9,7 @@ artifact:
     - "model/node.py"
     - "model/ant.py"
     - "model/driver.py"
+    - "model/task.py"
     - "model/enviroment.py"
     - "model/aco.py"
     - "services/osrm_client.py"
@@ -167,6 +168,7 @@ artifact:
 * [`model/node.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/node.py)：物流节点实体（经纬度坐标、先序依赖列表）。
 * [`model/ant.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/ant.py)：单只蚂蚁行动者（禁忌表、自适应邻域剪枝、步进移动）。
 * [`model/driver.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/driver.py)：运力司机业务领域模型（GPS当前起点、载重容量约束、执行路线与状态机）。
+* [`model/task.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/task.py)：取送订单任务原子实体（绑定取送对、自动注入先序依赖约束与几何中点）。
 * [`model/enviroment.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/enviroment.py)：拓扑与信息素网络（支持 OSRM 注入与 Haversine 兜底）。
 * [`model/aco.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/aco.py)：蚁群优化算法主调度器（轮盘赌、精英强化、闭环/开环自适应）。
 * [`services/osrm_client.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/services/osrm_client.py)：OSRM Table API 专用客户端。

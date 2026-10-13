@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model.node import Node
 from model.ant import Ant
 from model.driver import Driver, DriverStatus
+from model.task import DeliveryTask
 from model.enviroment import Environment
 from model.aco import ACO
 from services.spatial_index import SpatialIndexer
@@ -179,5 +180,32 @@ class TestACOEndToEnd(unittest.TestCase):
         self.assertLess(idx_p, idx_d, f"取货点索引({idx_p})必须小于送货点索引({idx_d})")
 
 
+class TestDeliveryTaskDomainModel(unittest.TestCase):
+    """验证 DeliveryTask 订单原子对的自动依赖注入与空间计算"""
+
+    def test_automatic_precedence_injection(self):
+        p = Node(name="Pickup", Lng=121.4, Lat=31.2)
+        d = Node(name="Delivery", Lng=121.5, Lat=31.3)
+        # 初始时 delivery 的 prerequisites 为空
+        self.assertNotIn(p.id, d.prerequisites)
+
+        # 组装为 DeliveryTask
+        task = DeliveryTask(task_name="Order 1", pickup=p, delivery=d, weight=5.0)
+
+        # 验证自动绑定钩子是否生效
+        self.assertIn(p.id, task.delivery.prerequisites, "实例化时送货点必须自动注入取货点ID")
+        self.assertEqual(task.weight, 5.0)
+
+    def test_midpoint_calculation(self):
+        p = Node(name="P", Lng=120.0, Lat=30.0)
+        d = Node(name="D", Lng=122.0, Lat=32.0)
+        task = DeliveryTask(task_name="Order Mid", pickup=p, delivery=d)
+
+        mid_lng, mid_lat = task.midpoint
+        self.assertAlmostEqual(mid_lng, 121.0)
+        self.assertAlmostEqual(mid_lat, 31.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
