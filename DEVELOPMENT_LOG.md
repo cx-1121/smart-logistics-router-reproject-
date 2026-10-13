@@ -8,16 +8,20 @@ artifact:
   dependencies:
     - "model/node.py"
     - "model/ant.py"
+    - "model/driver.py"
     - "model/enviroment.py"
     - "model/aco.py"
     - "services/osrm_client.py"
+    - "services/spatial_index.py"
     - "main.py"
   related_requirements:
     - "FR-01: 智能物流路由规划 (ACO求解)"
     - "FR-02: 取送货先序依赖约束 (PDP)"
     - "FR-03: 真实路网矩阵集成 (OSRM)"
     - "FR-04: 多模式适配 (大仓闭环 vs Grab即时配送开环)"
-  timestamp: "2026-10-11T12:43:00Z"
+    - "FR-05: 空间蜂窝网格索引与剪枝 (Uber H3)"
+    - "FR-06: 运力司机领域模型解耦与状态机 (Driver)"
+  timestamp: "2026-10-13T05:51:00Z"
 ---
 
 # 智能物流路由系统开发日志 (Development Log)
@@ -35,7 +39,8 @@ artifact:
 4. [真实业务约束建模：先序取送与综合成本](#四真实业务约束建模先序取送与综合成本)
 5. [系统分层与外部路网解耦（OSRM 客户端）](#五系统分层与外部路网解耦osrm-客户端)
 6. [业务模式演进：传统大仓 vs Grab 即时配送](#六业务模式演进传统大仓-vs-grab-即时配送)
-7. [当前代码结构与后续规划](#七当前代码结构与后续规划)
+7. [空间网格索引与剪枝实战（Uber H3）](#八空间网格索引与剪枝实战uber-h3)
+8. [当前代码结构与后续规划](#七当前代码结构与后续规划)
 
 ---
 
@@ -156,12 +161,33 @@ artifact:
 ### 7.1 文件清单
 * [`model/node.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/node.py)：物流节点实体（经纬度坐标、先序依赖列表）。
 * [`model/ant.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/ant.py)：单只蚂蚁行动者（禁忌表、自适应邻域剪枝、步进移动）。
+* [`model/driver.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/driver.py)：运力司机业务领域模型（GPS当前起点、载重容量约束、执行路线与状态机）。
 * [`model/enviroment.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/enviroment.py)：拓扑与信息素网络（支持 OSRM 注入与 Haversine 兜底）。
 * [`model/aco.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/model/aco.py)：蚁群优化算法主调度器（轮盘赌、精英强化、闭环/开环自适应）。
 * [`services/osrm_client.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/services/osrm_client.py)：OSRM Table API 专用客户端。
+* [`services/spatial_index.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/services/spatial_index.py)：基于 Uber H3 的六边形空间索引与自适应扩圈检索服务。
+* [`demo_h3.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/demo_h3.py)：多运力多起点空间网格剪枝演示实测脚本。
 * [`main.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/main.py)：端到端仿真验证与先序合规性自动化校验。
 
 ### 7.2 后续演进路线
 1. **开环 GrabFood 模式正式参数化**：将 `is_closed_loop` 参数正式合入 `ACO` 与示例配置；
-2. **时间窗约束 (VRPTW)**：为节点加入送达时间上下限（`time_window = (earliest, latest)`）；
-3. **多车容量约束 (CVRP)**：单车最大载重限制与满载回仓/换车逻辑。
+2. **两阶段多运力派单流串联**：将 `SpatialIndexer`、订单对聚类与各司机的局部 `ACO` 串成完整派单系统；
+3. **时间窗约束 (VRPTW)**：为节点加入送达时间上下限（`time_window = (earliest, latest)`）；
+4. **多车容量约束 (CVRP)**：单车最大载重限制与满载回仓/换车逻辑。
+
+---
+
+## 八、空间网格索引与剪枝实战（Uber H3）
+
+### 8.1 开源算法库 vs 远程 API 定位
+* **特性**：Uber H3 是由 Uber 开源的离散全区六边形分层空间索引（Apache 2.0），纯 C 底层并绑定 Python；
+* **优势**：本地内存微秒/纳秒级纯数学位运算，无网络延迟、无 API Key、无费用限制，离线支撑百万级高并发坐标转换。
+
+### 8.2 空间剪枝与自适应扩圈服务（`SpatialIndexer`）
+* **网格选型**：采用 Resolution 8（六边形边长约 460 米，单蜂窝面积约 0.7 平方公里），精准对应即时配送微商圈与社区尺度；
+* **哈希桶映射**：将全城订单按经纬度转换为 64 位整数十六进制 ID，建立 $O(1)$ 网格倒排索引；
+* **自适应同心环扩散（`find_nearby_nodes`）**：
+  * 基于 `grid_disk` 算子实现 $k=0 \to k=1 \to k_{\max}$ 渐进扩散；
+  * 市中心骑手瞬间只圈定身边 $k=1$ 圈内的顺路单，直接剪掉外围 90%+ 的无效远距计算；
+  * 偏远骑手在近处无单时自动向外扩搜（Fallback），保证长尾订单不丢单。
+
