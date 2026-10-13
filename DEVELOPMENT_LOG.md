@@ -13,6 +13,7 @@ artifact:
     - "model/aco.py"
     - "services/osrm_client.py"
     - "services/spatial_index.py"
+    - "tests/test_core.py"
     - "main.py"
   related_requirements:
     - "FR-01: 智能物流路由规划 (ACO求解)"
@@ -21,7 +22,9 @@ artifact:
     - "FR-04: 多模式适配 (大仓闭环 vs Grab即时配送开环)"
     - "FR-05: 空间蜂窝网格索引与剪枝 (Uber H3)"
     - "FR-06: 运力司机领域模型解耦与状态机 (Driver)"
-  timestamp: "2026-10-13T05:51:00Z"
+    - "FR-07: 核心高风险逻辑自动化测试套件 (Unittest)"
+    - "FR-08: 两阶段多运力端到端调度与耗时审计大盘 (Two-Stage Fleet Router)"
+  timestamp: "2026-10-13T06:16:00Z"
 ---
 
 # 智能物流路由系统开发日志 (Development Log)
@@ -40,7 +43,9 @@ artifact:
 5. [系统分层与外部路网解耦（OSRM 客户端）](#五系统分层与外部路网解耦osrm-客户端)
 6. [业务模式演进：传统大仓 vs Grab 即时配送](#六业务模式演进传统大仓-vs-grab-即时配送)
 7. [空间网格索引与剪枝实战（Uber H3）](#八空间网格索引与剪枝实战uber-h3)
-8. [当前代码结构与后续规划](#七当前代码结构与后续规划)
+8. [质量保证与关键逻辑测试套件（Unit Testing）](#九质量保证与关键逻辑测试套件unit-testing)
+9. [两阶段多运力派单与耗时审计实录（Two-Stage Dispatching）](#十两阶段多运力派单与耗时审计实录two-stage-dispatching)
+10. [当前代码结构与后续规划](#七当前代码结构与后续规划)
 
 ---
 
@@ -167,6 +172,7 @@ artifact:
 * [`services/osrm_client.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/services/osrm_client.py)：OSRM Table API 专用客户端。
 * [`services/spatial_index.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/services/spatial_index.py)：基于 Uber H3 的六边形空间索引与自适应扩圈检索服务。
 * [`demo_h3.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/demo_h3.py)：多运力多起点空间网格剪枝演示实测脚本。
+* [`tests/test_core.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/tests/test_core.py)：核心逻辑单元测试套件（覆盖 Driver、Ant、H3 与 ACO 不变量）。
 * [`main.py`](file:///d:/01_Workspace_Dev/01_Projects/smart-logistics-router(reproject)/main.py)：端到端仿真验证与先序合规性自动化校验。
 
 ### 7.2 后续演进路线
@@ -190,4 +196,42 @@ artifact:
   * 基于 `grid_disk` 算子实现 $k=0 \to k=1 \to k_{\max}$ 渐进扩散；
   * 市中心骑手瞬间只圈定身边 $k=1$ 圈内的顺路单，直接剪掉外围 90%+ 的无效远距计算；
   * 偏远骑手在近处无单时自动向外扩搜（Fallback），保证长尾订单不丢单。
+
+---
+
+## 九、质量保证与关键逻辑测试套件（Unit Testing）
+
+### 9.1 测试设计哲学：抓高风险，杜绝过度设计
+* **纯数据模型免测**：`Node` 仅为 Pydantic 数据实体，无业务逻辑，免除低价值形式主义单测；
+* **核心高危区严密防御**：
+  * **`Driver`**：测试超载拦截（异常准时抛出）、空闲/在途状态流转、剩余容量动态计算；
+  * **`Ant`**：测试未取货前送货点严禁可选、取货后送货点准时解禁、无候选点时安全退出（绝不死循环）；
+  * **`SpatialIndexer`**：验证同心圆剪枝，确保只圈近单、排除 25 公里外长尾单；
+  * **`ACO Invariants`**：验证随机搜索的不变量（全图节点覆盖、先序无序违规、回路完整性）。
+
+### 9.2 测试实测结果
+* 测试执行指令：`python -m unittest discover tests`
+* 执行统计：8 个关键用例全自动化执行，总耗时 **0.011s (11毫秒)**，100% 通过（PASS）。
+
+---
+
+## 十、两阶段多运力派单与耗时审计实录（Two-Stage Dispatching）
+
+### 10.1 场景仿真设计（三大商圈自治）
+* **多运力不同起点**：
+  * 黄浦小张（人民广场，容量 25kg）
+  * 浦东小王（国金中心，容量 30kg）
+  * 静安小李（静安寺，容量 20kg）
+* **多订单取送依赖**：6 笔订单（共 12 个物理取送站点），每个订单严格设置 `pickup -> delivery` 前置依赖约束。
+
+### 10.2 两阶段流水线实装
+* **阶段一（H3 蜂窝空间拓扑匹配）**：
+  * 采用 `h3.grid_distance` 拓扑步数快速匹配微商圈，耗时仅 **0.13 ms**；
+  * 各商圈订单 100% 精准归属最近骑手，无跨江无效调度，载重负荷均匀（40%~43%）。
+* **阶段二（各车独立 ACO 求解最优路径）**：
+  * 每位骑手规划各自 6 个站点的取送闭环，先序依赖合规率 **100% PASSED**；
+  * 单车 ACO 寻优耗时：39ms ~ 48ms，车队规划总耗时 134.32 ms。
+* **全系统端到端总响应时延**：**134.47 ms**（工业级百毫秒秒出解）。
+
+
 

@@ -78,3 +78,12 @@ class Driver(BaseModel):
     def update_location(self, new_location: Node):
         """Update driver's current real-time GPS coordinate node."""
         self.current_location = new_location
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if isinstance(other, Driver):
+            return self.id == other.id
+        return False
+
