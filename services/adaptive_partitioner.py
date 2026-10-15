@@ -71,7 +71,7 @@ class AdaptiveH3Partitioner:
         # 1. Initial coarse aggregation at base_resolution (e.g. Res 5)
         initial_buckets: Dict[str, List[DeliveryTask]] = {}
         for order in orders:
-            base_cell = h3.latlng_to_cell(order.pickup.Lat, order.pickup.Lng, self.base_resolution)
+            base_cell = self._cell_at(order.pickup, self.base_resolution)
             initial_buckets.setdefault(base_cell, []).append(order)
 
         final_partitions: Dict[str, List[DeliveryTask]] = {}
@@ -81,6 +81,18 @@ class AdaptiveH3Partitioner:
             self._split_or_finalize(cell, task_list, final_partitions)
 
         return final_partitions
+
+    def _cell_at(self, node: Node, res: int) -> str:
+        """
+        H3 cell of a node at resolution res, derived from its max_resolution cell via cell_to_parent.
+        latlng_to_cell at a coarser resolution is not guaranteed to be the parent of the finer cell
+        (H3 children only approximately tile their parent), so mixing the two lets sibling buckets
+        of different parents map to the same child cell and overwrite each other's orders.
+        """
+        fine_cell = h3.latlng_to_cell(node.Lat, node.Lng, self.max_resolution)
+        if res >= self.max_resolution:
+            return fine_cell
+        return h3.cell_to_parent(fine_cell, res)
 
     def _split_or_finalize(
         self,
@@ -103,7 +115,7 @@ class AdaptiveH3Partitioner:
         child_buckets: Dict[str, List[DeliveryTask]] = {}
 
         for task in task_list:
-            child_cell = h3.latlng_to_cell(task.pickup.Lat, task.pickup.Lng, next_res)
+            child_cell = self._cell_at(task.pickup, next_res)
             child_buckets.setdefault(child_cell, []).append(task)
 
         # Recursively evaluate each child bucket
@@ -133,7 +145,7 @@ class AdaptiveH3Partitioner:
 
             # Map couriers into this adaptive zone based on current GPS location
             for driver in drivers:
-                d_cell = h3.latlng_to_cell(driver.current_location.Lat, driver.current_location.Lng, res)
+                d_cell = self._cell_at(driver.current_location, res)
 
                 if d_cell == cell_id:
                     zone.primary_drivers.append(driver)

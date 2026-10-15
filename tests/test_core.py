@@ -567,6 +567,38 @@ class TestAdaptiveH3Partitioner(unittest.TestCase):
         single_cell = list(partitions.keys())[0]
         self.assertEqual(h3.get_resolution(single_cell), 5, "Sparse task must remain at base resolution 5")
 
+    def test_no_orders_lost_when_split_cells_straddle_parents(self):
+        """
+        Regression: the 50x500 benchmark lost 132/500 orders because a pickup's latlng_to_cell at res 6
+        is not always a child of its res 5 cell, so splitting two res 5 buckets produced the same res 6
+        key and the second bucket overwrote the first. Every order must land in exactly one zone.
+        """
+        import random
+        from services.adaptive_partitioner import AdaptiveH3Partitioner
+        rng = random.Random(1042)  # Same order stream as benchmark_concurrency.generate_orders(seed=42)
+        orders = []
+        for i in range(500):
+            p_lng, p_lat = 101.55 + rng.random() * 0.20, 3.05 + rng.random() * 0.20
+            d_lng, d_lat = p_lng + (rng.random() - 0.5) * 0.04, p_lat + (rng.random() - 0.5) * 0.04
+            rng.random()  # weight draw, kept to stay in step with the benchmark generator
+            orders.append(DeliveryTask(
+                task_name=f"Order-{i}",
+                pickup=Node(name=f"P-{i}", Lng=p_lng, Lat=p_lat),
+                delivery=Node(name=f"D-{i}", Lng=d_lng, Lat=d_lat),
+            ))
+
+        partitioner = AdaptiveH3Partitioner(base_resolution=5, max_resolution=7, max_orders_per_zone=45)
+        partitions = partitioner.partition_orders(orders)
+
+        partitioned_ids = [o.id for zone_orders in partitions.values() for o in zone_orders]
+        self.assertEqual(len(partitioned_ids), 500, "Every order must be kept by the partitioner")
+        self.assertEqual(len(set(partitioned_ids)), 500, "No order may appear in two zones")
+        for cell, zone_orders in partitions.items():
+            res = h3.get_resolution(cell)
+            for o in zone_orders:
+                fine = h3.latlng_to_cell(o.pickup.Lat, o.pickup.Lng, 7)
+                self.assertEqual(fine if res == 7 else h3.cell_to_parent(fine, res), cell)
+
 
 class TestEnvironmentCache(unittest.TestCase):
     """Verify cached distance/cost lookups never recompute the Haversine fallback."""
