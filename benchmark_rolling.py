@@ -27,6 +27,7 @@ def build_policy(name: str, args):
         candidates_per_courier=args.candidates,
         couriers_per_order=args.couriers_per_order,
         bb_node_limit=args.bb_nodes,
+        rc_threshold_km=args.rc_window,
     ))
 
 
@@ -83,6 +84,7 @@ def main():
     parser.add_argument("--candidates", type=int, default=10)
     parser.add_argument("--couriers-per-order", type=int, default=3)
     parser.add_argument("--bb-nodes", type=int, default=ExactConfig.bb_node_limit)
+    parser.add_argument("--rc-window", type=float, default=ExactConfig.rc_threshold_km)
     parser.add_argument("--all-batches", action="store_true", help="Print every batch, not just injection batches")
     args = parser.parse_args()
 

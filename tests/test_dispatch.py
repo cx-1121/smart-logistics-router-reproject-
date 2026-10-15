@@ -176,6 +176,23 @@ class TestSetPartition(unittest.TestCase):
             np.testing.assert_allclose(a @ res.z, 1.0, atol=1e-7)
             self.assertTrue(np.all(np.abs(res.z[:n_x] - np.round(res.z[:n_x])) < 1e-6))
 
+    def test_odd_cycle_is_cut_at_the_root(self):
+        """Three couriers, three orders, each courier column holding two of them: the LP takes every
+        pair at 0.5 (value 1.5) while any integer plan serves at most one pair. A clique cut must
+        lift the root bound to the integer optimum."""
+        # Rows: groups 0..2, items 3..5. Columns: a pair per group, an empty column per group, slacks.
+        cols = [[0, 3, 4], [1, 4, 5], [2, 5, 3], [0], [1], [2], [3], [4], [5]]
+        cost = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0])
+        rows = [r for c in cols for r in c]
+        col_idx = [j for j, c in enumerate(cols) for _ in c]
+        a = csc_matrix((np.ones(len(rows)), (rows, col_idx)), shape=(6, len(cols)))
+        mask = np.ones(len(cols), dtype=bool)
+        res = solve_set_partition(cost, a, 6, 3, mask, mask, tau=100.0)
+        self.assertTrue(res.proved_optimal)
+        self.assertGreaterEqual(res.cuts, 1)
+        self.assertAlmostEqual(res.objective, 11.0)       # One pair plus one unassigned order
+        self.assertAlmostEqual(res.lower_bound, 11.0)     # Without the cut the root LP is 1.5
+
 
 def make_order(oid, p, d, weight=2.0, release_batch=0):
     return Order(id=oid, pickup_lat=p[0], pickup_lng=p[1], delivery_lat=d[0], delivery_lng=d[1],
@@ -260,6 +277,54 @@ class TestRollingSimulator(unittest.TestCase):
     def test_scenario_is_deterministic(self):
         again = generate_kl_scenario(num_couriers=6, num_orders=40, orders_per_batch=10, seed=11)
         self.assertEqual(self.scenario, again)
+
+
+class TestOfflineReference(unittest.TestCase):
+    """Offline full-information solutions must be feasible and bracketed by bound and online run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scenario = generate_kl_scenario(num_couriers=5, num_orders=30, orders_per_batch=10, seed=8)
+        cls.online = RollingSimulator(cls.scenario, ExactBatchPolicy()).run()
+
+    def _check_routes(self, routes):
+        sc = self.scenario
+        seen = []
+        for d, route in enumerate(routes):
+            load, held, picked = 0.0, 0, set()
+            for oid, kind in route:
+                w = sc.orders[oid].weight
+                if kind == PICKUP:
+                    picked.add(oid)
+                    load += w
+                    held += 1
+                else:
+                    self.assertIn(oid, picked, "Delivery before pickup or on another courier")
+                    load -= w
+                    held -= 1
+                    seen.append(oid)
+                self.assertLessEqual(load, sc.couriers[d].capacity + 1e-9)
+                self.assertLessEqual(held, sc.max_orders_held)
+        self.assertEqual(sorted(seen), list(range(len(sc.orders))))
+
+    def test_replay_of_online_visits_never_exceeds_driven_km(self):
+        from dispatch import offline
+        replay = offline.schedule(self.scenario, self.online.courier_visits)
+        self.assertLessEqual(replay.total_km, self.online.total_km + 1e-6)
+        self.assertTrue(np.all(replay.delivery_latency_s > 0))
+
+    def test_offline_solutions_are_feasible_and_bracketed(self):
+        from dispatch import offline
+        lower = offline.assignment_lower_bound(self.scenario)
+        replay_km = offline.schedule(self.scenario, self.online.courier_visits).total_km
+        free = offline.solve_offline(self.scenario, self.online.courier_visits, None, time_limit_s=2)
+        deadline_s = self.online.makespan_s + 60
+        timed = offline.solve_offline(self.scenario, self.online.courier_visits, deadline_s, time_limit_s=2)
+        for res in (free, timed):
+            self._check_routes(res.routes)
+            self.assertLessEqual(lower, res.schedule.total_km + 1e-6)
+            self.assertLessEqual(res.schedule.total_km, replay_km + 0.01)  # Warm-started from the online routes
+        self.assertLessEqual(timed.schedule.makespan_s, deadline_s + 1e-6)
 
 
 class _ScriptedPolicy:

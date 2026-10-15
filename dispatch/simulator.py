@@ -61,6 +61,7 @@ class SimulationResult:
     makespan_s: float
     delivery_latency_s: np.ndarray    # Delivery time minus release time, per order
     reassignments: int
+    courier_visits: List[List[Stop]]  # Stops each courier actually reached, in order
 
     @property
     def solve_ms(self) -> np.ndarray:
@@ -93,6 +94,7 @@ class RollingSimulator:
         self.onboard: List[List[int]] = [[] for _ in range(n_couriers)]
         self.plans: List[List[Stop]] = [[] for _ in range(n_couriers)]
         self.km = np.zeros(n_couriers)
+        self.visits: List[List[Stop]] = [[] for _ in range(n_couriers)]
         self.released: Dict[int, Order] = {}
         self.delivered_at: Dict[int, float] = {}
         self.pool: List[int] = []
@@ -161,6 +163,7 @@ class RollingSimulator:
             makespan_s=max(self.delivered_at.values()) if self.delivered_at else 0.0,
             delivery_latency_s=latency,
             reassignments=reassignments,
+            courier_visits=self.visits,
         )
 
     def _apply(self, new_plans: List[List[Stop]]) -> int:
@@ -229,6 +232,7 @@ class RollingSimulator:
                     self.km[d] += dist
                     self.lat[d], self.lng[d] = s_lat, s_lng
                     plan.pop(0)
+                    self.visits[d].append((oid, kind))
                     if kind == PICKUP:
                         self.onboard[d].append(oid)
                         self.load[d] += order.weight

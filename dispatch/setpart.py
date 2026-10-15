@@ -8,19 +8,32 @@ The first n_groups rows are group rows (one per courier, covered by exactly one 
 the rest are item rows (one per order, covered by a binary column or its continuous slack).
 
 Strategy (all LPs share one HiGHS instance, so every re-solve is warm-started from the last basis):
-  1. LP relaxation by column generation over the explicit column pool: solve on a working set,
-     price all columns with one sparse mat-vec, add those with negative reduced cost, repeat.
+  1. Root LP by column generation over the explicit column pool (solve on a working set, price
+     every column with one sparse mat-vec, add those with negative reduced cost), interleaved with
+     clique cuts: columns that pairwise share a row can have at most one at 1, so a set of them
+     with LP values summing above 1 yields the valid cut sum z <= 1. Set-partitioning LPs are
+     fractional mostly through such odd cycles of columns; on the hard batches a handful of cuts
+     closes most of the gap that otherwise costs hundreds of branch-and-bound nodes. A pool column
+     outside the model has coefficient 0 in every cut, which keeps the cuts valid for the whole pool.
      The final LP value is the lower bound LB over the full pool.
   2. Reduced-cost fixing: any integer solution costs LB + sum_j rc_j z_j with rc >= 0, so a column
      with rc_j > UB - LB cannot be in a solution at least as good as UB. Branch-and-bound runs on
      the columns with rc <= tau; if the best solution found has UB - LB <= tau, it is optimal over
      the whole pool, otherwise tau grows to UB - LB and the search repeats.
-  3. Depth-first branch-and-bound with assignment branching (Ryan-Foster on a group row and an
-     item row): take the (group g, item o) pair whose LP share is closest to 0.5 and branch on
-     "g serves o" (columns of g without o, and other columns with o, fixed to 0) versus "g does not
-     serve o" (columns of g with o fixed to 0). The rule is balanced and complete: when every share
-     is 0/1, each group has exactly one positive column. Nodes whose LP value cannot beat the
-     incumbent are pruned. If the node budget runs out, HiGHS' own MIP finishes the restricted problem.
+  3. The restricted problem splits into independent blocks (rows linked only through shared
+     columns: couriers and orders in different parts of the city). A single search tree over all
+     blocks multiplies their sizes, because backtracking in one block re-solves the others; so each
+     fractional block is searched on its own, its best solution fixed, and the next block taken.
+     Blocks share no rows or columns (cuts too stay inside one block), so the sum of their optima
+     is the joint optimum. When the window widens, the previous round's solution seeds each block's
+     incumbent.
+  4. Depth-first branch-and-bound per block with assignment branching (Ryan-Foster on a group row
+     and an item row): take the fractional (group g, item o) pair with the largest LP share and
+     branch on "g serves o" (columns of g without o, and other columns with o, fixed to 0) first,
+     then "g does not serve o" (columns of g with o fixed to 0). The rule is complete: when every
+     share is 0/1, each group has exactly one positive column. Each node separates a few more
+     clique cuts; nodes whose LP value cannot beat the incumbent are pruned. If the node budget
+     runs out, HiGHS' own MIP finishes the restricted problem.
 """
 import time
 from dataclasses import dataclass
@@ -29,6 +42,7 @@ from typing import Optional
 import highspy
 import numpy as np
 from scipy.sparse import csc_matrix
+from scipy.sparse.csgraph import connected_components
 
 _INF = highspy.kHighsInf
 
@@ -37,11 +51,12 @@ _INF = highspy.kHighsInf
 class SetPartitionResult:
     z: np.ndarray            # Solution over all columns of the pool
     objective: float
-    lower_bound: float       # LP relaxation over the full pool
+    lower_bound: float       # Root LP (with cuts) over the full pool
     proved_optimal: bool
     lp_ms: float
     bb_ms: float
     lp_rounds: int
+    cuts: int
     bb_nodes: int
     fixing_rounds: int
     restricted_columns: int
@@ -50,9 +65,9 @@ class SetPartitionResult:
 
 class _Model:
     """
-    One HiGHS LP whose columns are a growing subset of the pool. Columns are fixed to zero through
-    reference counts, so nested branching fixings and the reduced-cost window compose and unwind
-    in any order.
+    One HiGHS LP whose columns are a growing subset of the pool, plus clique-cut rows. Columns are
+    fixed to zero through reference counts, so nested branching fixings and the reduced-cost window
+    compose and unwind in any order.
     """
     def __init__(self, n_rows: int, n_pool: int):
         self.h = highspy.Highs()
@@ -60,6 +75,8 @@ class _Model:
         self.h.setOptionValue("simplex_strategy", 1)  # Dual simplex: best for re-solves after bound changes
         ones = np.ones(n_rows)
         self.h.addRows(n_rows, ones, ones, 0, np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0))
+        self.n_base_rows = n_rows
+        self.cuts = 0
         self.pool_index = np.zeros(0, dtype=np.int64)         # Model column -> pool column
         self.model_pos = np.full(n_pool, -1, dtype=np.int64)  # Pool column -> model column (-1 absent)
         self.fix_count = np.zeros(0, dtype=np.int64)
@@ -74,6 +91,11 @@ class _Model:
         self.pool_index = np.concatenate([self.pool_index, cols])
         self.fix_count = np.concatenate([self.fix_count, np.zeros(len(cols), dtype=np.int64)])
 
+    def add_cut(self, cols: np.ndarray):
+        """sum of z over the given model columns <= 1."""
+        self.h.addRow(-_INF, 1.0, len(cols), cols.astype(np.int32), np.ones(len(cols)))
+        self.cuts += 1
+
     def solve(self) -> Optional[float]:
         self.h.run()
         if self.h.getModelStatus() != highspy.HighsModelStatus.kOptimal:
@@ -83,8 +105,12 @@ class _Model:
     def values(self) -> np.ndarray:
         return np.asarray(self.h.getSolution().col_value)
 
-    def duals(self) -> np.ndarray:
-        return np.asarray(self.h.getSolution().row_dual)
+    def base_row_duals(self) -> np.ndarray:
+        return np.asarray(self.h.getSolution().row_dual)[:self.n_base_rows]
+
+    def reduced_costs(self) -> np.ndarray:
+        """Reduced costs of the model's columns, including the cut rows' duals."""
+        return np.asarray(self.h.getSolution().col_dual)
 
     def fix_zero(self, cols: np.ndarray):
         """Fix model columns to zero (stackable)."""
@@ -114,8 +140,10 @@ def solve_set_partition(
     n_groups: int,
     initial: np.ndarray,
     always: np.ndarray,
-    tau: float = 2.0,
+    tau: float = 0.5,
     pricing_batch: int = 500,
+    root_cut_rounds: int = 20,
+    node_cut_rounds: int = 3,
     node_limit: int = 2000,
     max_fixing_rounds: int = 6,
     fallback_time_limit_s: float = 25.0,
@@ -138,19 +166,25 @@ def solve_set_partition(
     in_model = initial.copy()
     model.add(a, cost, np.flatnonzero(in_model))
     lp_rounds = 0
+    cut_rounds = 0
     while True:
         lp_rounds += 1
         lower = model.solve()
         if lower is None:
             raise RuntimeError("Set-partitioning LP relaxation is infeasible")
-        reduced = cost - a_csr.T @ model.duals()
+        reduced = cost - a_csr.T @ model.base_row_duals()  # Exact for columns outside the model (in no cut)
+        reduced[model.pool_index] = model.reduced_costs()
         entering = np.flatnonzero(~in_model & (reduced < -tol))
-        if len(entering) == 0:
-            break
-        if len(entering) > pricing_batch:
-            entering = entering[np.argpartition(reduced[entering], pricing_batch)[:pricing_batch]]
-        in_model[entering] = True
-        model.add(a, cost, entering)
+        if len(entering):
+            if len(entering) > pricing_batch:
+                entering = entering[np.argpartition(reduced[entering], pricing_batch)[:pricing_batch]]
+            in_model[entering] = True
+            model.add(a, cost, entering)
+            continue
+        if cut_rounds < root_cut_rounds and _separate_cliques(model, a, None) > 0:
+            cut_rounds += 1
+            continue
+        break
     reduced = np.maximum(reduced, 0.0)
     lp_ms = (time.perf_counter() - t0) * 1000
 
@@ -174,10 +208,12 @@ def solve_set_partition(
         outside = np.flatnonzero(~allowed[model.pool_index])
         model.fix_zero(outside)
 
-        found, nodes_used, finished = _branch_and_bound(model, a, a_csr, n_int, n_groups, best_obj, tol,
-                                                        node_limit - nodes)
+        block_of_row, block_of_col = _blocks(a, allowed, n_int)
+        found, nodes_used, finished = _solve_by_blocks(model, a, a_csr, n_int, n_groups, block_of_row,
+                                                       block_of_col, best_z, tol, node_cut_rounds,
+                                                       node_limit - nodes)
         nodes += nodes_used
-        if found is not None:
+        if found is not None and found[0] < best_obj:
             best_obj = found[0]
             best_z = np.zeros(n_cols)
             best_z[model.pool_index] = found[1]
@@ -207,6 +243,7 @@ def solve_set_partition(
         lp_ms=lp_ms,
         bb_ms=(time.perf_counter() - t1) * 1000,
         lp_rounds=lp_rounds,
+        cuts=model.cuts,
         bb_nodes=nodes,
         fixing_rounds=fixing_rounds,
         restricted_columns=restricted,
@@ -214,16 +251,137 @@ def solve_set_partition(
     )
 
 
-def _branch_and_bound(model: _Model, a: csc_matrix, a_csr, n_int: int, n_groups: int,
-                      incumbent: float, tol: float, node_budget: int):
+def _separate_cliques(model: _Model, a: csc_matrix, only: Optional[np.ndarray], max_cuts: int = 100) -> int:
     """
-    Depth-first branch-and-bound over the model's current columns with assignment branching.
-    Returns (best (objective, z in model order) improving on incumbent or None, nodes used,
-    finished within budget). Every fixing made here is undone before returning.
+    Greedy clique separation on the current LP solution. Columns conflict when they share a row;
+    starting from each positive column (largest value first), greedily grow a set of pairwise
+    conflicting positive columns and add sum z <= 1 when it is violated and not already one of the
+    rows (no single row is common to all members). only (bool per model column) limits candidates.
+    Returns the number of cuts added.
+    """
+    z = model.values()
+    positive = z > 1e-6
+    if only is not None:
+        positive &= only
+    pos = np.flatnonzero(positive)
+    if len(pos) < 3:
+        return 0
+    sub = a[:, model.pool_index[pos]]
+    conflict = (sub.T @ sub).toarray() > 0
+    np.fill_diagonal(conflict, False)
+    order = np.argsort(-z[pos], kind="stable")
+    seen = set()
+    added = 0
+    for start in order:
+        members = [start]
+        candidates = conflict[start].copy()
+        for j in order:
+            if candidates[j]:
+                members.append(j)
+                candidates &= conflict[j]
+        if len(members) < 3 or z[pos[members]].sum() <= 1.0 + 1e-6:
+            continue
+        key = tuple(sorted(members))
+        if key in seen:
+            continue
+        seen.add(key)
+        common = sub[:, members].sum(axis=1).A1 == len(members)
+        if common.any():
+            continue  # Already implied by a partitioning row
+        model.add_cut(pos[members])
+        added += 1
+        if added >= max_cuts:
+            break
+    return added
+
+
+def _blocks(a: csc_matrix, allowed: np.ndarray, n_int: int):
+    """
+    (block of each row, block of each pool column): rows are linked when an allowed binary column
+    covers both; a column belongs to the block of its first row (a group row, or a slack's item row).
+    """
+    sub = a[:, np.flatnonzero(allowed[:n_int])]
+    _, block_of_row = connected_components((sub @ sub.T).tocsr(), directed=False)
+    first_row = a.indices[a.indptr[:-1]]
+    return block_of_row, block_of_row[first_row]
+
+
+def _solve_by_blocks(model: _Model, a: csc_matrix, a_csr, n_int: int, n_groups: int,
+                     block_of_row: np.ndarray, block_of_col: np.ndarray, previous: Optional[np.ndarray],
+                     tol: float, cut_rounds: int, node_budget: int):
+    """
+    Solve the model's current restricted problem to integrality one independent block at a time.
+    previous (pool order) is an integer solution from a narrower window, or None; it is feasible
+    here and gives each block a starting incumbent.
+    Returns ((objective, z in model order) or None, nodes used, finished within budget).
+    All fixings made here are undone before returning (cuts stay: they are valid everywhere).
+    """
+    nodes = 1
+    value = model.solve()
+    if value is None:
+        return None, nodes, True
+    committed = []
+    model_block = block_of_col[model.pool_index]
+    finished = True
+    while True:
+        z = model.values()
+        branch = _pick_assignment(model, a, z, n_int, n_groups, None)
+        if branch is None:
+            result = (value, z.copy())
+            break
+        block = block_of_row[branch[0]]
+        in_block = np.flatnonzero(model_block == block)
+        incumbent = np.inf
+        fix_previous = None
+        if previous is not None:
+            # The previous solution's pattern on this block, evaluated with the other blocks at their LP
+            fix_previous = in_block[previous[model.pool_index[in_block]] < 0.5]
+            model.fix_zero(fix_previous)
+            seeded = model.solve()
+            nodes += 1
+            model.unfix(fix_previous)
+            if seeded is not None:
+                incumbent = seeded
+        best, used, done = _branch_and_bound(model, a, a_csr, n_int, n_groups, block, model_block,
+                                             incumbent, tol, cut_rounds, node_budget - nodes)
+        nodes += used
+        if not done:
+            finished = False
+            result = None
+            break
+        if best is not None:
+            # Commit the block's optimum: every column of the block that is zero there stays zero
+            fix = in_block[best[1][in_block] < 0.5]
+        elif np.isfinite(incumbent):
+            fix = fix_previous  # Nothing beats the previous pattern on this block
+        else:
+            raise RuntimeError("A feasible block produced no integer solution")
+        model.fix_zero(fix)
+        committed.append(fix)
+        value = model.solve()
+        nodes += 1
+        if value is None:
+            raise RuntimeError("Committing a block optimum made the LP infeasible")
+    for fix in reversed(committed):
+        model.unfix(fix)
+    return result, nodes, finished
+
+
+def _branch_and_bound(model: _Model, a: csc_matrix, a_csr, n_int: int, n_groups: int,
+                      block: int, model_block: np.ndarray, incumbent: float, tol: float,
+                      cut_rounds: int, node_budget: int):
+    """
+    Depth-first branch-and-bound with assignment branching, restricted to one block: a node is a
+    leaf once the block's assignment shares are all 0/1 (other blocks are independent and keep
+    their LP values, so comparing whole-LP values compares this block's objective).
+    Only solutions strictly better than incumbent are returned.
+    Returns (best (objective, z in model order) or None, nodes used, finished within budget).
+    Every fixing made here is undone before returning.
     """
     best = None
     best_obj = incumbent
     nodes = 0
+    in_block = model_block == block
     # Frames: None = root, ("fix", cols) = branch to apply, ("undo", cols) = restore on backtrack
     stack = [None]
     while stack:
@@ -243,31 +401,39 @@ def _branch_and_bound(model: _Model, a: csc_matrix, a_csr, n_int: int, n_groups:
             return best, nodes, False
         nodes += 1
         value = model.solve()
+        for _ in range(cut_rounds):
+            if value is None or value >= best_obj - tol:
+                break
+            if _separate_cliques(model, a, in_block) == 0:
+                break
+            value = model.solve()
         if value is None or value >= best_obj - tol:
             continue
         z = model.values()
-        branch = _pick_assignment(model, a, z, n_int, n_groups)
+        branch = _pick_assignment(model, a, z, n_int, n_groups, (model_block, block))
         if branch is None:
             best_obj = value
             best = (value, z.copy())
             continue
-        g, item_row, share = branch
+        g, item_row, _ = branch
         serves, not_serves = _assignment_branches(model, a_csr, g, item_row)
-        # Depth-first into the likelier side first (pushed last)
-        if share >= 0.5:
-            stack.append(("fix", not_serves))
-            stack.append(("fix", serves))
-        else:
-            stack.append(("fix", serves))
-            stack.append(("fix", not_serves))
+        # Dive into "g serves o" first (pushed last)
+        stack.append(("fix", not_serves))
+        stack.append(("fix", serves))
     return best, nodes, True
 
 
-def _pick_assignment(model: _Model, a: csc_matrix, z: np.ndarray, n_int: int, n_groups: int):
-    """(group row, item row, LP share) with share closest to 0.5, or None when all shares are 0/1."""
+def _pick_assignment(model: _Model, a: csc_matrix, z: np.ndarray, n_int: int, n_groups: int, only_block):
+    """
+    (group row, item row, LP share) of the fractional pair with the largest share, or None when all
+    shares are 0/1. only_block = (block of each model column, block id) limits the search to one block.
+    """
     positive = np.flatnonzero(z > 1e-9)
     pool = model.pool_index[positive]
     binary = pool < n_int
+    if only_block is not None:
+        model_block, block = only_block
+        binary &= model_block[positive] == block
     share = {}
     for j_model, j_pool in zip(positive[binary], pool[binary]):
         rows = a.indices[a.indptr[j_pool]:a.indptr[j_pool + 1]]
@@ -275,20 +441,19 @@ def _pick_assignment(model: _Model, a: csc_matrix, z: np.ndarray, n_int: int, n_
         for r in rows[rows >= n_groups]:
             key = (g, int(r))
             share[key] = share.get(key, 0.0) + z[j_model]
-    best_key, best_dist = None, 0.5 - 1e-6
+    best_key, best_share = None, 0.0
     for key, v in share.items():
-        dist = abs(v - 0.5)
-        if dist < best_dist:
-            best_key, best_dist = key, dist
+        if 1e-6 < v < 1.0 - 1e-6 and v > best_share:
+            best_key, best_share = key, v
     if best_key is None:
         return None
-    return best_key[0], best_key[1], share[best_key]
+    return best_key[0], best_key[1], best_share
 
 
 def _assignment_branches(model: _Model, a_csr, g: int, item_row: int):
     """
     Model columns to fix to zero in each branch:
-    'g serves item'        -> columns of g without the item, and columns of other groups (or the slack) with it
+    'g serves item'         -> columns of g without the item, and columns of other groups (or the slack) with it
     'g does not serve item' -> columns of g with the item
     """
     def model_cols(row):

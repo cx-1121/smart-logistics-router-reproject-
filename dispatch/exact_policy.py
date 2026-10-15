@@ -279,6 +279,7 @@ class ExactBatchPolicy:
             "fixing_rounds": sp.fixing_rounds,
             "lp_rounds": sp.lp_rounds,
             "bb_nodes": sp.bb_nodes,
+            "cuts": sp.cuts,
             "fallback": float(sp.used_fallback),
             "lp_ms": sp.lp_ms,
             "bb_ms": sp.bb_ms,
