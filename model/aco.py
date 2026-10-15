@@ -1,6 +1,10 @@
 import random
-from typing import List, Optional, Tuple
-from model.ant import Ant
+from typing import Dict, List, Optional, Tuple
+from uuid import UUID
+
+import numpy as np
+
+from model.aco_core import ACOParams, ACOProblem, solve_aco
 from model.enviroment import Environment
 from model.node import Node
 
@@ -10,6 +14,8 @@ class ACO:
     Ant Colony Optimization (ACO) solver for smart logistics route planning.
     - Uses geodesic distance for spatial pruning in neighborhood search.
     - Uses generalized business cost for heuristic evaluation and route selection.
+    Node/UUID objects are translated once into integer-indexed numpy matrices; the hot loop
+    runs in model.aco_core on plain arrays (see build_problem / to_node_path for process pools).
     """
     def __init__(
         self,
@@ -24,121 +30,94 @@ class ACO:
         initial_radius: float = 30.0,# Initial neighborhood search radius (km)
         radius_step: float = 10.0,   # Adaptive radius expansion step (km)
         max_radius: float = 200.0,   # Maximum allowable search radius (km)
+        initial_path: Optional[List[Node]] = None,  # Warm-start closed-loop path (e.g. previous route + insertions)
     ):
         self.env = env
         self.depot = depot
-        self.num_ants = num_ants
-        self.max_iter = max_iter
-        self.alpha = alpha
-        self.beta = beta
-        self.rho = rho
-        self.q = q
-        self.initial_radius = initial_radius
-        self.radius_step = radius_step
-        self.max_radius = max_radius
+        self.params = ACOParams(
+            num_ants=num_ants,
+            max_iter=max_iter,
+            alpha=alpha,
+            beta=beta,
+            rho=rho,
+            q=q,
+            initial_radius=initial_radius,
+            radius_step=radius_step,
+            max_radius=max_radius,
+        )
+        self.initial_path = initial_path
+        self.index_of: Dict[UUID, int] = {n.id: i for i, n in enumerate(env.nodes)}
 
         # Global best solution trackers
         self.best_path: List[Node] = []
         self.best_cost: float = float("inf")
 
-    def _select_next_node(self, current: Node, candidates: List[Node]) -> Node:
-        """
-        Select next destination node using roulette wheel selection
-        based on pheromone intensity (tau) and heuristic cost (eta = 1/cost).
-        """
-        if len(candidates) == 1:
-            return candidates[0]
+    def _eligible_start_indices(self) -> List[int]:
+        """Fixed depot if specified, otherwise nodes without prerequisites (or any node as last resort)."""
+        if self.depot:
+            return [self.index_of[self.depot.id]]
+        starts = [i for i, node in enumerate(self.env.nodes) if not node.prerequisites]
+        return starts or list(range(len(self.env.nodes)))
 
-        weights: List[float] = []
-        for candidate in candidates:
-            # 1. Pheromone trail component
-            tau = self.env.get_pheromone(current, candidate) ** self.alpha
+    def _warm_start_indices(self, eligible_starts: List[int]) -> Optional[np.ndarray]:
+        """Validate the warm-start path: closed loop, eligible origin, covering exactly the node set."""
+        path = self.initial_path
+        if not path or len(path) < 2 or path[-1].id != path[0].id:
+            return None
+        if {n.id for n in path} != set(self.index_of):
+            return None
+        idx = np.array([self.index_of[n.id] for n in path], dtype=np.int64)
+        if idx[0] not in eligible_starts:
+            return None
+        return idx
 
-            # 2. Heuristic component (lower cost results in higher attractiveness)
-            cost = self.env.get_cost(current, candidate)
-            eta = (1.0 / cost) ** self.beta
+    def build_problem(self, seed: Optional[int] = None) -> ACOProblem:
+        """Translate the Node/UUID environment into a picklable, integer-indexed ACOProblem."""
+        nodes = self.env.nodes
+        n = len(nodes)
+        dist = np.array([[self.env.get_distance(u, v) for v in nodes] for u in nodes], dtype=float)
+        cost = np.array([[self.env.get_cost(u, v) for v in nodes] for u in nodes], dtype=float)
+        pheromone = np.array([[self.env.get_pheromone(u, v) for v in nodes] for u in nodes], dtype=float)
 
-            weights.append(tau * eta)
+        # Precedence: a prerequisite outside this environment can never be visited, so it stays unmet forever
+        prereq_count = np.zeros(n, dtype=np.int64)
+        dependents = np.zeros((n, n), dtype=np.int64)
+        for j, node in enumerate(nodes):
+            for pre_id in node.prerequisites:
+                prereq_count[j] += 1
+                if pre_id in self.index_of:
+                    dependents[self.index_of[pre_id], j] += 1
 
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            return random.choice(candidates)
+        eligible = self._eligible_start_indices()
+        return ACOProblem(
+            dist=dist,
+            cost=cost,
+            pheromone=pheromone,
+            prereq_count=prereq_count,
+            dependents=dependents,
+            eligible_starts=np.array(eligible, dtype=np.int64),
+            params=self.params,
+            initial_path=self._warm_start_indices(eligible),
+            seed=seed if seed is not None else random.getrandbits(63),
+        )
 
-        # Roulette wheel sampling
-        pick = random.uniform(0, total_weight)
-        current_sum = 0.0
-        for i, weight in enumerate(weights):
-            current_sum += weight
-            if current_sum >= pick:
-                return candidates[i]
-
-        return candidates[-1]
+    def to_node_path(self, path_indices: List[int]) -> List[Node]:
+        return [self.env.nodes[i] for i in path_indices]
 
     def run(self) -> Tuple[List[Node], float]:
         """
         Execute main ACO optimization loop.
         :return: (best_route_nodes, best_total_cost)
         """
-        total_nodes_count = len(self.env.nodes)
+        result = solve_aco(self.build_problem())
 
-        # Determine eligible starting nodes: fixed depot if specified, or nodes without prerequisites
-        if self.depot:
-            eligible_starts = [self.depot]
-        else:
-            eligible_starts = [node for node in self.env.nodes if not node.prerequisites]
-            if not eligible_starts:
-                eligible_starts = self.env.nodes
+        # Write back learned trails so the Environment remains the owner of the pheromone network
+        nodes = self.env.nodes
+        for i, u in enumerate(nodes):
+            for j, v in enumerate(nodes):
+                if i != j:
+                    self.env.pheromone_matrix[(u.id, v.id)] = float(result.pheromone[i, j])
 
-        for iteration in range(self.max_iter):
-            # 1. Spawn num_ants per generation at eligible origin nodes
-            ants = [
-                Ant(start_node=random.choice(eligible_starts))
-                for _ in range(self.num_ants)
-            ]
-
-            completed_ants: List[Ant] = []
-
-            # 2. Path construction for each ant
-            for ant in ants:
-                while True:
-                    available = ant.get_available_nodes(
-                        all_nodes=self.env.nodes,
-                        get_distance_func=self.env.get_distance,
-                        initial_radius=self.initial_radius,
-                        radius_step=self.radius_step,
-                        max_radius=self.max_radius,
-                    )
-
-                    if not available:
-                        break  # No more candidate nodes available
-
-                    # Select next node via roulette wheel based on generalized cost
-                    next_node = self._select_next_node(ant.current_node, available)
-                    step_cost = self.env.get_cost(ant.current_node, next_node)
-                    ant.move_to(next_node, step_cost)
-
-                # Check if all customer nodes were successfully serviced
-                if len(ant.visited_ids) == total_nodes_count:
-                    # Circuit closing: return from final customer back to origin depot
-                    return_cost = self.env.get_cost(ant.current_node, ant.start_node)
-                    ant.move_to(ant.start_node, return_cost)
-                    completed_ants.append(ant)
-
-            # 3. Update global best solution with current generation achievements
-            for ant in completed_ants:
-                if ant.total_cost < self.best_cost:
-                    self.best_cost = ant.total_cost
-                    self.best_path = list(ant.path)
-
-            # 4. Global pheromone evaporation
-            self.env.evaporate(self.rho)
-
-            # 5. Pheromone reinforcement from successful ants
-            for ant in completed_ants:
-                self.env.release_pheromone(ant.path, ant.total_cost, self.q)
-
-            # Elitist strategy: provide additional reinforcement to global best route
-            if self.best_path:
-                self.env.release_pheromone(self.best_path, self.best_cost, self.q * 1.5)
-
+        self.best_path = self.to_node_path(result.best_path)
+        self.best_cost = result.best_cost
         return self.best_path, self.best_cost

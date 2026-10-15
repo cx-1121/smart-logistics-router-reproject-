@@ -9,66 +9,69 @@ from services.spatial_index import SpatialIndexer
 
 
 def demo_uber_h3_spatial_indexing():
-    print("=" * 60)
-    print("🚀 [DEMO] Uber H3 空间蜂窝网格索引与自适应剪枝实测")
-    print("=" * 60)
+    print("=" * 70)
+    print("🚀 [DEMO] Uber H3 Hexagonal Spatial Indexing & Neighborhood Pruning")
+    print("=" * 70)
+    print("Geographic Scope: Greater Kuala Lumpur (Klang Valley, Malaysia)")
+    print("Coordinate Standard: Native WGS-84 (EPSG:4326)")
+    print("-" * 70)
 
-    # 1. 模拟全城分散的 8 个订单（包含闹市区集中单与偏远郊区孤单）
+    # 1. Simulate 8 dispersed orders across Klang Valley (urban core clusters vs remote suburban outliers)
     orders = [
-        # 人民广场/南京东路附近 (高密度核心区)
-        Node(name="外卖订单 1 (黄浦区人民广场)", Lng=121.4737, Lat=31.2304),
-        Node(name="外卖订单 2 (黄浦区南京东路)", Lng=121.4850, Lat=31.2380),
-        Node(name="外卖订单 3 (静安区静安寺)",   Lng=121.4460, Lat=31.2230),
+        # Downtown Kuala Lumpur / Golden Triangle core cluster
+        Node(name="Order 1 (Suria KLCC Churn)",        Lng=101.7120, Lat=3.1582),
+        Node(name="Order 2 (Pavilion Bukit Bintang)",  Lng=101.7130, Lat=3.1488),
+        Node(name="Order 3 (Changkat Gastropub)",      Lng=101.7085, Lat=3.1475),
 
-        # 浦东陆家嘴区域
-        Node(name="外卖订单 4 (浦东陆家嘴)",     Lng=121.5050, Lat=31.2400),
-        Node(name="外卖订单 5 (浦东世纪大道)",   Lng=121.5280, Lat=31.2300),
+        # Petaling Jaya commercial cluster (~10km west)
+        Node(name="Order 4 (SS2 Durian Street)",       Lng=101.6215, Lat=3.1192),
+        Node(name="Order 5 (Damansara Uptown Bistro)", Lng=101.6230, Lat=3.1360),
 
-        # 远郊孤立单 (极其偏远地区)
-        Node(name="外卖订单 6 (嘉定新城远郊单)", Lng=121.2500, Lat=31.3500),
-        Node(name="外卖订单 7 (青浦朱家角远郊单)", Lng=121.0500, Lat=31.1100),
-        Node(name="外卖订单 8 (崇明堡镇海岛单)", Lng=121.6000, Lat=31.5400),
+        # Distant peripheral outliers (Suburban & Remote)
+        Node(name="Order 6 (Rawang Suburb Outlier)",   Lng=101.5750, Lat=3.3210),
+        Node(name="Order 7 (Cyberjaya Tech Campus)",   Lng=101.6500, Lat=2.9210),
+        Node(name="Order 8 (Genting Highlands Resort)", Lng=101.7900, Lat=3.4240),
     ]
 
-    # 2. 模拟 2 名身处不同起点的骑手
-    driver_huangpu = Node(name="骑手-小张 (身在人民广场)", Lng=121.4740, Lat=31.2310)
-    driver_jiading = Node(name="骑手-老李 (身在嘉定郊区)", Lng=121.2510, Lat=31.3520)
+    # 2. Simulate 2 couriers at distinct starting coordinates
+    driver_klcc = Node(name="Rider Farhan (KLCC)", Lng=101.7118, Lat=3.1578)
+    driver_rawang = Node(name="Rider Azman (Rawang Suburb)", Lng=101.5760, Lat=3.3220)
 
-    # 3. 初始化 H3 空间索引器并建索引 (Resolution=8，蜂窝边长约 460米)
+    # 3. Initialize H3 SpatialIndexer and bulk index nodes (Resolution=8, cell edge ~460m)
     indexer = SpatialIndexer(resolution=8)
     indexer.build_index(orders)
 
-    print(f"\n[1] 成功将 {len(orders)} 个订单编入 H3 空间网格桶:")
+    print(f"\n[1] Successfully indexed {len(orders)} orders into H3 hexagonal buckets:")
     for order in orders:
         cell = indexer.get_node_cell(order)
-        print(f"  • {order.name:<25} -> H3 Cell: {cell}")
+        print(f"  • {order.name:<34} -> H3 Cell: {cell}")
 
-    # 4. 场景测试 A：骑手小张在人民广场核心区找单（就近圈定，剪枝 80% 远单）
-    print(f"\n[2] 场景 A: 【{driver_huangpu.name}】圈定周边候选单 (最大圈层 k=2, 约2公里)")
-    candidates_a = indexer.find_nearby_nodes(driver_huangpu, max_k_ring=2)
-    print(f"  -> 命中候选单数量: {len(candidates_a)} / {len(orders)}")
+    # 4. Scenario A: Rider Farhan finds orders around KLCC (pruning distant orders)
+    print(f"\n[2] Scenario A: 【{driver_klcc.name}】queries neighborhood (max ring k=2, ~2km)")
+    candidates_a = indexer.find_nearby_nodes(driver_klcc, max_k_ring=2)
+    print(f"  -> Captured candidates: {len(candidates_a)} / {len(orders)}")
     for cand in candidates_a:
-        print(f"     ✅ 圈中顺路单: {cand.name}")
+        print(f"     ✅ Matched neighborhood order: {cand.name}")
 
-    # 5. 场景测试 B：骑手老李在偏远嘉定找单（只圈出嘉定本地单，绝不跨区拉取市区单）
-    print(f"\n[3] 场景 B: 【{driver_jiading.name}】圈定周边候选单 (最大圈层 k=2)")
-    candidates_b = indexer.find_nearby_nodes(driver_jiading, max_k_ring=2)
-    print(f"  -> 命中候选单数量: {len(candidates_b)} / {len(orders)}")
+    # 5. Scenario B: Rider Azman queries orders around Rawang (captures local outlier only)
+    print(f"\n[3] Scenario B: 【{driver_rawang.name}】queries neighborhood (max ring k=2)")
+    candidates_b = indexer.find_nearby_nodes(driver_rawang, max_k_ring=2)
+    print(f"  -> Captured candidates: {len(candidates_b)} / {len(orders)}")
     for cand in candidates_b:
-        print(f"     ✅ 圈中本地单: {cand.name}")
+        print(f"     ✅ Matched local suburb order: {cand.name}")
 
-    # 6. 场景测试 C：自适应阶梯扩圈验证（如果近处 1 圈没人，自动向外扩搜）
-    print(f"\n[4] 场景 C: 验证自适应扩圈 (当 k=1 无单时自动向外扩)")
-    far_driver = Node(name="路人骑手 (距离陆家嘴较远 3 公里)", Lng=121.5500, Lat=31.2500)
-    # k=1 找不到，扩到 k=3 成功找到陆家嘴和世纪大道附近的单
-    candidates_c = indexer.find_nearby_nodes(far_driver, max_k_ring=4, min_candidates=1)
-    print(f"  -> 自适应扩圈后捕获订单数量: {len(candidates_c)}")
+    # 6. Scenario C: Verify adaptive ring expansion (gradually expand when immediate ring k=1 is empty)
+    print(f"\n[4] Scenario C: Verify adaptive expansion (expands outward when immediate ring is empty)")
+    far_driver = Node(name="En-route Rider (Ampang ~3km away)", Lng=101.7450, Lat=3.1550)
+    # Expands up to k=5 to capture KLCC area orders
+    candidates_c = indexer.find_nearby_nodes(far_driver, max_k_ring=5, min_candidates=1)
+    print(f"  -> Captured orders via adaptive expansion: {len(candidates_c)}")
     for cand in candidates_c:
-        print(f"     🔍 扩圈捕获: {cand.name}")
+        print(f"     🔍 Captured candidate: {cand.name}")
 
-    print("\n" + "=" * 60)
-    print("🎉 验证成功: 空间网格完美隔离不同区域运力，无多余几何计算！")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("🎉 Verification SUCCESS: H3 spatial indexing isolates district dispatch effortlessly!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

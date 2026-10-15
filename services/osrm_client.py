@@ -86,3 +86,26 @@ class OSRMClient:
         except Exception as e:
             logger.warning(f"OSRM query encountered exception ({e}).")
             return None
+
+    def get_matrices_concurrent(
+        self,
+        node_groups: List[List[Node]],
+        max_workers: int = 4
+    ) -> List[Optional[Tuple[Dict[Tuple[UUID, UUID], float], Dict[Tuple[UUID, UUID], float]]]]:
+        """
+        Scenario 2: Concurrent multi-threaded I/O query for multiple regional node clusters.
+        Utilizes ThreadPoolExecutor to bypass Python GIL during network I/O waiting periods,
+        executing multiple HTTP requests in parallel.
+        """
+        if not node_groups:
+            return []
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        actual_workers = min(len(node_groups), max_workers)
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            # Map get_matrix across all node groups concurrently
+            results = list(executor.map(self.get_matrix, node_groups))
+
+        return results
+

@@ -105,13 +105,20 @@ class Environment:
         """Retrieve physical distance (used for spatial neighborhood search)."""
         if n1.id == n2.id:
             return 0.0
-        return self._distance_cache.get((n1.id, n2.id), self._calc_haversine_distance(n1, n2))
+        # Explicit lookup: dict.get(key, default) would eagerly evaluate the Haversine fallback on every call
+        cached = self._distance_cache.get((n1.id, n2.id))
+        if cached is not None:
+            return cached
+        return self._calc_haversine_distance(n1, n2)
 
     def get_cost(self, n1: Node, n2: Node) -> float:
         """Retrieve generalized cost (used for heuristic evaluation eta = 1/cost)."""
         if n1.id == n2.id:
             return 0.0
-        return self._cost_cache.get((n1.id, n2.id), self._calc_cost(n1, n2, self.get_distance(n1, n2)))
+        cached = self._cost_cache.get((n1.id, n2.id))
+        if cached is not None:
+            return cached
+        return self._calc_cost(n1, n2, self.get_distance(n1, n2))
 
     def get_random_node(self) -> Node:
         """Randomly select a node to serve as an ant's initial origin."""
